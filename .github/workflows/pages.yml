@@ -1,0 +1,395 @@
+name: Deploy Bilbao Daily PWA
+
+on:
+  push:
+    branches: ["main"]
+  schedule:
+    - cron: "30 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build daily PWA
+        run: |
+          mkdir -p public/assets
+          cat > build.mjs <<'NODE'
+          import { mkdir, writeFile } from "node:fs/promises";
+
+          const SOURCES = [
+            { name: "Bizkaia Gaur", url: "https://www.bizkaiagaur.com/feed/", category: "Bizkaia" },
+            { name: "EITB Noticias", url: "https://www.eitb.eus/es/rss/noticias/", category: "Регион" },
+            { name: "Cadena SER Euskadi", url: "https://cadenaser.com/rss/euskadi.xml", category: "Регион" },
+            { name: "Bilbao Secreto", url: "https://bilbaosecreto.com/feed/", category: "Город" }
+          ];
+
+          const eventWords = ["concierto", "kontzertu", "exposici", "festival", "teatro", "antzerki", "taller", "feria", "mercado", "agenda", "jornada", "curso", "charla", "musica", "música", "visita"];
+          const attentionWords = ["huelga", "paro", "corte", "cerrad", "aviso", "alerta", "trafico", "tráfico", "metro", "bilbobus", "renfe", "obras", "interrupci", "cancelad", "incidencia"];
+
+          const now = new Date();
+          const pageDate = new Intl.DateTimeFormat("ru-RU", { dateStyle: "full", timeZone: "Europe/Madrid" }).format(now);
+          const updatedAt = new Intl.DateTimeFormat("ru-RU", { dateStyle: "medium", timeStyle: "short", timeZone: "Europe/Madrid" }).format(now);
+
+          async function main() {
+            await mkdir("public/assets", { recursive: true });
+            const [weather, feedItems] = await Promise.all([getWeather(), getFeedItems()]);
+            const recent = pickRecent(feedItems);
+            const translated = [];
+            for (const item of recent.slice(0, 16)) {
+              const title = sentence(await toRussian(item.title), 120);
+              const baseBody = item.description || item.title;
+              const body = sentence(await toRussian(baseBody), 360);
+              translated.push({ ...item, title: title || item.title, body: body || title || item.title });
+            }
+
+            const events = translated.filter(isEvent).slice(0, 5);
+            const weatherAlerts = buildWeatherAlerts(weather);
+            const itemAlerts = translated.filter(isAttention).slice(0, 4).map((item) => ({
+              label: "Важно",
+              severity: "medium",
+              title: item.title,
+              body: item.body,
+              sourceName: item.sourceName,
+              url: item.url
+            }));
+            const attention = [...weatherAlerts, ...itemAlerts].slice(0, 6);
+            const eventUrls = new Set(events.map((item) => item.url));
+            const attentionUrls = new Set(itemAlerts.map((item) => item.url));
+            const news = translated.filter((item) => !eventUrls.has(item.url) && !attentionUrls.has(item.url)).slice(0, 8);
+
+            await writeFile("public/index.html", renderHtml({ weather, news, events, attention }), "utf8");
+            await writeFile("public/manifest.webmanifest", JSON.stringify(manifest(), null, 2), "utf8");
+            await writeFile("public/sw.js", serviceWorker(), "utf8");
+            await writeFile("public/assets/icon.svg", iconSvg(), "utf8");
+            await writeFile("public/.nojekyll", "", "utf8");
+          }
+
+          async function getWeather() {
+            const params = new URLSearchParams({
+              latitude: "43.263",
+              longitude: "-2.935",
+              current: "temperature_2m,precipitation,rain,weather_code",
+              daily: "weather_code,temperature_2m_max,temperature_2m_min,precipitation_probability_max,precipitation_sum,wind_speed_10m_max",
+              forecast_days: "1",
+              timezone: "Europe/Madrid"
+            });
+            const data = await fetchJson("https://api.open-meteo.com/v1/forecast?" + params.toString());
+            const d = data.daily || {};
+            const c = data.current || {};
+            const code = Number((d.weather_code || [c.weather_code || 0])[0] || 0);
+            return {
+              temp: Math.round(Number(c.temperature_2m || 0)),
+              min: Math.round(Number((d.temperature_2m_min || [0])[0] || 0)),
+              max: Math.round(Number((d.temperature_2m_max || [0])[0] || 0)),
+              rainChance: Math.round(Number((d.precipitation_probability_max || [0])[0] || 0)),
+              rainMm: Number((d.precipitation_sum || [0])[0] || 0),
+              wind: Math.round(Number((d.wind_speed_10m_max || [0])[0] || 0)),
+              code,
+              label: weatherLabel(code)
+            };
+          }
+
+          async function getFeedItems() {
+            const batches = await Promise.allSettled(SOURCES.map(async (source) => {
+              const xml = await fetchText(source.url);
+              return parseFeed(xml, source);
+            }));
+            return batches.flatMap((batch) => batch.status === "fulfilled" ? batch.value : []);
+          }
+
+          async function fetchText(url) {
+            const res = await fetch(url, { headers: { "user-agent": "BilbaoDailyPWA/1.0", "accept": "application/rss+xml, application/xml, text/xml, text/html" } });
+            if (!res.ok) throw new Error(String(res.status) + " " + url);
+            return res.text();
+          }
+
+          async function fetchJson(url) {
+            const res = await fetch(url, { headers: { "user-agent": "BilbaoDailyPWA/1.0" } });
+            if (!res.ok) throw new Error(String(res.status) + " " + url);
+            return res.json();
+          }
+
+          function parseFeed(xml, source) {
+            const blocks = [...xmlBlocks(xml, "item"), ...xmlBlocks(xml, "entry")];
+            return blocks.map((block) => {
+              const title = compact(tag(block, "title"));
+              const description = compact(tag(block, "description") || tag(block, "summary") || tag(block, "content:encoded"));
+              const url = compact(linkFrom(block));
+              const dateText = compact(tag(block, "pubDate") || tag(block, "updated") || tag(block, "published"));
+              const date = dateText ? new Date(dateText) : new Date();
+              return { title, description, url, publishedAt: Number.isFinite(date.getTime()) ? date.toISOString() : now.toISOString(), sourceName: source.name, sourceUrl: source.url, category: source.category };
+            }).filter((item) => item.title && item.url);
+          }
+
+          function xmlBlocks(xml, name) {
+            const out = [];
+            const lower = xml.toLowerCase();
+            const open = "<" + name;
+            const close = "</" + name + ">";
+            let pos = 0;
+            while (true) {
+              const start = lower.indexOf(open, pos);
+              if (start < 0) break;
+              const end = lower.indexOf(close, start);
+              if (end < 0) break;
+              out.push(xml.slice(start, end + close.length));
+              pos = end + close.length;
+            }
+            return out;
+          }
+
+          function tag(block, name) {
+            const lower = block.toLowerCase();
+            const open = "<" + name.toLowerCase();
+            const start = lower.indexOf(open);
+            if (start < 0) return "";
+            const gt = block.indexOf(">", start);
+            if (gt < 0) return "";
+            const close = lower.indexOf("</" + name.toLowerCase() + ">", gt);
+            if (close < 0) return "";
+            return block.slice(gt + 1, close);
+          }
+
+          function linkFrom(block) {
+            const textLink = tag(block, "link");
+            if (compact(textLink)) return textLink;
+            const lower = block.toLowerCase();
+            const start = lower.indexOf("<link");
+            if (start < 0) return "";
+            const end = block.indexOf(">", start);
+            const chunk = block.slice(start, end > start ? end : start + 200);
+            return attr(chunk, "href");
+          }
+
+          function attr(chunk, name) {
+            for (const quote of ["\"", "'"]) {
+              const key = name + "=" + quote;
+              const lower = chunk.toLowerCase();
+              const start = lower.indexOf(key);
+              if (start >= 0) {
+                const from = start + key.length;
+                const to = chunk.indexOf(quote, from);
+                return to > from ? chunk.slice(from, to) : "";
+              }
+            }
+            return "";
+          }
+
+          function pickRecent(items) {
+            const seen = new Set();
+            const sorted = items.sort((a, b) => new Date(b.publishedAt) - new Date(a.publishedAt)).filter((item) => {
+              const key = item.url.split("?")[0];
+              if (seen.has(key)) return false;
+              seen.add(key);
+              return true;
+            });
+            const tenDays = 10 * 24 * 60 * 60 * 1000;
+            const recent = sorted.filter((item) => now - new Date(item.publishedAt) < tenDays);
+            return recent.length >= 6 ? recent : sorted;
+          }
+
+          const translationCache = new Map();
+          async function toRussian(text) {
+            const cleaned = compact(text).slice(0, 700);
+            if (!cleaned) return "";
+            if (hasRussian(cleaned)) return cleaned;
+            if (translationCache.has(cleaned)) return translationCache.get(cleaned);
+            try {
+              const url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ru&dt=t&q=" + encodeURIComponent(cleaned);
+              const data = await fetchJson(url);
+              const translated = (data[0] || []).map((row) => row[0] || "").join("").trim();
+              const result = translated || cleaned;
+              translationCache.set(cleaned, result);
+              return result;
+            } catch {
+              return cleaned;
+            }
+          }
+
+          function hasRussian(text) {
+            for (const ch of text.toLowerCase()) if (ch >= "а" && ch <= "я") return true;
+            return false;
+          }
+
+          function compact(value) {
+            let text = decodeEntities(String(value || ""));
+            text = text.split("<![CDATA[").join("").split("]]>").join("");
+            text = stripTags(text);
+            for (const ch of [String.fromCharCode(10), String.fromCharCode(13), String.fromCharCode(9)]) text = text.split(ch).join(" ");
+            while (text.includes("  ")) text = text.replaceAll("  ", " ");
+            return text.trim();
+          }
+
+          function stripTags(text) {
+            let out = "";
+            let inside = false;
+            for (const ch of text) {
+              if (ch === "<") inside = true;
+              else if (ch === ">") inside = false;
+              else if (!inside) out += ch;
+            }
+            return out;
+          }
+
+          function decodeEntities(text) {
+            const map = { "&amp;": "&", "&lt;": "<", "&gt;": ">", "&quot;": "\"", "&#39;": "'", "&apos;": "'", "&nbsp;": " " };
+            for (const [from, to] of Object.entries(map)) text = text.split(from).join(to);
+            return text;
+          }
+
+          function sentence(text, max) {
+            text = compact(text);
+            if (text.length <= max) return text;
+            let cut = text.slice(0, max);
+            const marks = [". ", "! ", "? ", ".", "!", "?"];
+            let best = -1;
+            for (const mark of marks) best = Math.max(best, cut.lastIndexOf(mark));
+            if (best > 80) cut = cut.slice(0, best + 1);
+            else cut = cut.slice(0, cut.lastIndexOf(" ") > 80 ? cut.lastIndexOf(" ") : max);
+            return cut.trim() + "...";
+          }
+
+          function isEvent(item) {
+            const hay = (item.title + " " + item.body + " " + item.category).toLowerCase();
+            return eventWords.some((word) => hay.includes(word));
+          }
+
+          function isAttention(item) {
+            const hay = (item.title + " " + item.body).toLowerCase();
+            return attentionWords.some((word) => hay.includes(word));
+          }
+
+          function buildWeatherAlerts(weather) {
+            const alerts = [];
+            if (weather.rainChance >= 55 || weather.rainMm >= 3) alerts.push({ label: "Дождь", severity: weather.rainChance >= 75 || weather.rainMm >= 8 ? "high" : "medium", title: "Возьми зонт", body: "Вероятность дождя " + weather.rainChance + "%, ожидается около " + weather.rainMm + " мм осадков.", sourceName: "Open-Meteo", url: "https://open-meteo.com/" });
+            if (weather.wind >= 45) alerts.push({ label: "Ветер", severity: "medium", title: "Сильный ветер", body: "Порывы могут доходить до " + weather.wind + " км/ч. Лучше проверить транспорт и планы на улице.", sourceName: "Open-Meteo", url: "https://open-meteo.com/" });
+            return alerts;
+          }
+
+          function weatherLabel(code) {
+            if ([0, 1].includes(code)) return "ясно";
+            if ([2, 3].includes(code)) return "облачно";
+            if ([45, 48].includes(code)) return "туман";
+            if ([51, 53, 55, 61, 63, 65, 80, 81, 82].includes(code)) return "дождь";
+            if ([95, 96, 99].includes(code)) return "гроза";
+            return "переменная погода";
+          }
+
+          function renderHtml(data) {
+            return `<!doctype html>
+          <html lang="ru">
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <meta name="theme-color" content="#071016">
+            <link rel="manifest" href="./manifest.webmanifest">
+            <link rel="icon" href="./assets/icon.svg" type="image/svg+xml">
+            <title>Bilbao Daily</title>
+            <style>${styles()}</style>
+          </head>
+          <body>
+            <main class="shell">
+              <header class="hero">
+                <div>
+                  <p class="eyebrow">Bilbao / Bizkaia</p>
+                  <h1>Дайджест на ${escapeHtml(pageDate)}</h1>
+                  <p class="sub">Коротко и по-русски: новости, дождь, события и то, что требует внимания.</p>
+                </div>
+                <button id="installBtn" hidden>Установить</button>
+              </header>
+
+              <section class="weather">
+                <div><span class="label">Погода</span><strong>${data.weather.temp}°</strong><p>${escapeHtml(data.weather.label)}, ${data.weather.min}° / ${data.weather.max}°</p></div>
+                <div><span class="label">Дождь</span><strong>${data.weather.rainChance}%</strong><p>${data.weather.rainMm} мм сегодня</p></div>
+                <div><span class="label">Ветер</span><strong>${data.weather.wind}</strong><p>км/ч максимум</p></div>
+              </section>
+
+              ${section("Требует внимания", data.attention, renderAttention, "Сейчас нет отдельных предупреждений.")}
+              ${section("Мероприятия", data.events, renderEvent, "Пока не нашел свежих мероприятий в источниках.")}
+              ${section("Новости", data.news, renderNews, "Пока нет свежих новостей в источниках.")}
+
+              <section class="sources"><h2>Источники</h2>${SOURCES.map((s) => `<a href="${escapeHtml(s.url)}">${escapeHtml(s.name)}</a>`).join("")}<a href="https://open-meteo.com/">Open-Meteo</a></section>
+              <footer>Обновлено: ${escapeHtml(updatedAt)}. Карточки короткие, но со ссылкой на первоисточник.</footer>
+            </main>
+            <script>
+              if ("serviceWorker" in navigator) navigator.serviceWorker.register("./sw.js");
+              const installBtn = document.getElementById("installBtn");
+              let deferredPrompt;
+              window.addEventListener("beforeinstallprompt", (event) => { event.preventDefault(); deferredPrompt = event; installBtn.hidden = false; });
+              installBtn.addEventListener("click", async () => { if (!deferredPrompt) return; deferredPrompt.prompt(); deferredPrompt = null; installBtn.hidden = true; });
+            </script>
+          </body>
+          </html>`;
+          }
+
+          function section(title, items, renderer, empty) {
+            return `<section><h2>${escapeHtml(title)}</h2><div class="grid">${items.length ? items.map(renderer).join("") : `<p class="empty">${escapeHtml(empty)}</p>`}</div></section>`;
+          }
+
+          function renderNews(item) {
+            return `<article class="card"><p class="meta">${escapeHtml(item.category)} · ${escapeHtml(item.sourceName)}</p><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.body)}</p><a href="${escapeHtml(item.url)}">Источник</a></article>`;
+          }
+
+          function renderEvent(item) {
+            return `<article class="card event"><p class="meta">${escapeHtml(item.sourceName)}</p><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.body)}</p><a href="${escapeHtml(item.url)}">Источник</a></article>`;
+          }
+
+          function renderAttention(item) {
+            return `<article class="card attention ${item.severity === "high" ? "high" : ""}"><p class="meta">${escapeHtml(item.label)} · ${escapeHtml(item.sourceName)}</p><h3>${escapeHtml(item.title)}</h3><p>${escapeHtml(item.body)}</p><a href="${escapeHtml(item.url)}">Источник</a></article>`;
+          }
+
+          function escapeHtml(value) {
+            return String(value || "").replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;").replaceAll("\"", "&quot;");
+          }
+
+          function manifest() {
+            return { name: "Bilbao Daily", short_name: "Bilbao", start_url: "./", scope: "./", display: "standalone", background_color: "#071016", theme_color: "#071016", lang: "ru", icons: [{ src: "assets/icon.svg", sizes: "any", type: "image/svg+xml", purpose: "any maskable" }] };
+          }
+
+          function serviceWorker() {
+            return `const CACHE = "bilbao-daily-v1";
+          const CORE = ["./", "./index.html", "./manifest.webmanifest", "./assets/icon.svg"];
+          self.addEventListener("install", (event) => { event.waitUntil(caches.open(CACHE).then((cache) => cache.addAll(CORE)).then(() => self.skipWaiting())); });
+          self.addEventListener("activate", (event) => { event.waitUntil(self.clients.claim()); });
+          self.addEventListener("fetch", (event) => {
+            if (event.request.mode === "navigate") event.respondWith(fetch(event.request).catch(() => caches.match("./index.html")));
+            else event.respondWith(fetch(event.request).catch(() => caches.match(event.request)));
+          });`;
+          }
+
+          function iconSvg() {
+            return `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512"><rect width="512" height="512" rx="112" fill="#071016"/><path d="M112 318c42-95 92-143 150-143 54 0 96 39 138 117" fill="none" stroke="#53d6ff" stroke-width="34" stroke-linecap="round"/><path d="M123 347h266" stroke="#ffcf5a" stroke-width="34" stroke-linecap="round"/><circle cx="346" cy="156" r="42" fill="#ffcf5a"/></svg>`;
+          }
+
+          function styles() {
+            return `:root{color-scheme:dark;--bg:#071016;--panel:#0d1a22;--soft:#122733;--text:#eef8ff;--muted:#98aebb;--line:#1f3a49;--blue:#53d6ff;--gold:#ffcf5a;--red:#ff6b6b}*{box-sizing:border-box}body{margin:0;background:radial-gradient(circle at top,#113142 0,#071016 42rem);font-family:Inter,system-ui,-apple-system,Segoe UI,sans-serif;color:var(--text)}a{color:var(--blue);text-decoration:none}.shell{width:min(1120px,100%);margin:auto;padding:24px}.hero{min-height:220px;display:flex;align-items:flex-end;justify-content:space-between;gap:20px;padding:28px 0}.eyebrow,.label,.meta{color:var(--muted);font-size:13px;letter-spacing:.08em;text-transform:uppercase}.hero h1{font-size:clamp(34px,7vw,72px);line-height:.95;margin:8px 0}.sub{max-width:620px;color:#c3d4dd;font-size:18px}button{border:0;border-radius:8px;background:var(--gold);color:#071016;font-weight:800;padding:12px 16px}.weather{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:8px 0 28px}.weather>div,.card,.sources{background:color-mix(in srgb,var(--panel) 92%,transparent);border:1px solid var(--line);border-radius:8px;padding:18px}.weather strong{display:block;font-size:42px;margin:8px 0}.weather p,.card p,footer{color:#c5d5dd}section{margin:30px 0}h2{font-size:24px;margin:0 0 14px}.grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:12px}.card{min-height:180px}.card h3{font-size:20px;margin:8px 0}.attention{border-color:#6b4b25;background:#1a1812}.attention.high{border-color:#6a2727;background:#1d1214}.event{border-color:#214f5f}.empty{grid-column:1/-1;color:var(--muted);border:1px dashed var(--line);border-radius:8px;padding:16px}.sources{display:flex;gap:12px;align-items:center;flex-wrap:wrap}.sources h2{width:100%;margin-bottom:2px}footer{border-top:1px solid var(--line);padding:20px 0 40px}@media(max-width:720px){.shell{padding:16px}.hero{display:block}.weather,.grid{grid-template-columns:1fr}.hero h1{font-size:44px}}`;
+          }
+
+          main().catch((error) => { console.error(error); process.exit(1); });
+          NODE
+          node build.mjs
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public
+
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
