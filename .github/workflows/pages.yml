@@ -28,7 +28,21 @@ jobs:
         run: |
           mkdir -p public/assets
           cat .github/build-digest-parts/*.b64 > build.b64
-          node -e "const fs=require('fs'),zlib=require('zlib');const s=fs.readFileSync('build.b64','utf8').replace(/\\s+/g,'');fs.writeFileSync('build.mjs',zlib.gunzipSync(Buffer.from(s,'base64')))"
+          node <<'PATCH'
+          const fs = require("fs");
+          const zlib = require("zlib");
+          const packed = fs.readFileSync("build.b64", "utf8").replace(/\s+/g, "");
+          let build = zlib.gunzipSync(Buffer.from(packed, "base64")).toString("utf8");
+          const eventLine = 'const eventWords = "concierto kontzertu exposici festival teatro antzerki taller feria mercado agenda jornada curso charla musica música visita bbk live".split(" ");';
+          const eventLinePatched = 'const eventWords = "concierto kontzertu exposici exposicion exposición festival teatro antzerki taller feria mercado agenda jornada curso charla musica música visita museo museoa entradas espectaculo espectáculo bbk live".split(" ");\n          const eventBlockWords = "ayuntamiento diputacion diputación gobierno consejo seguridad emergencia emergencias simulacro coordinacion coordinación euskaltzaindia academia industria industry decarbonized sustainable competitivo sector empresa empresas junta".split(" ");';
+          const filterLine = "const rawEvents = items.filter((item) => hasAny(item.raw, eventWords)).slice(0, 5);";
+          const filterLinePatched = "const rawEvents = items.filter((item) => hasAny(item.raw, eventWords) && !hasAny(item.raw, eventBlockWords)).slice(0, 5);";
+          if (!build.includes(eventLine) || !build.includes(filterLine)) {
+            throw new Error("Digest generator shape changed; event classifier patch was not applied.");
+          }
+          build = build.replace(eventLine, eventLinePatched).replace(filterLine, filterLinePatched);
+          fs.writeFileSync("build.mjs", build);
+          PATCH
           node build.mjs
       - name: Setup Pages
         uses: actions/configure-pages@v5
