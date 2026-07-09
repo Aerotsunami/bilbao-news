@@ -27,7 +27,8 @@ jobs:
       - name: Build daily digest
         run: |
           mkdir -p public/assets
-          node -e "const fs=require('fs'),zlib=require('zlib');fs.writeFileSync('build.mjs',zlib.gunzipSync(Buffer.from(fs.readFileSync('.github/build-digest.mjs.gz.b64','utf8').trim(),'base64')))"
+          cat .github/build-digest-parts/*.b64 > build.b64
+          node -e "const fs=require('fs'),zlib=require('zlib');const s=fs.readFileSync('build.b64','utf8').replace(/\\s+/g,'');fs.writeFileSync('build.mjs',zlib.gunzipSync(Buffer.from(s,'base64')))"
           node build.mjs
       - name: Setup Pages
         uses: actions/configure-pages@v5
